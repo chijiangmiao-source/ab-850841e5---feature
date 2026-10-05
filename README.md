@@ -13,6 +13,12 @@ Docker Compose 一键交付页面、健康响应与自动验收。
 | 投票标识内容改变 / 不同摘要：**记录冲突、隔离、不参与封存** | `VOTE_ID_CHANGED` / `DIGEST_MISMATCH`，冲突票单列展示且重传去重回放 |
 | 站点不在冻结名单：**配置不符拒绝** | `STATION_NOT_LISTED`，响应附带冻结名单 |
 | 多站并发达到阈值：**只生成一份不可变证书** | 判定→计数→封签→fsync 落盘全部在全局锁同一临界区；证书含 SHA-256 指纹，`immutable=true` |
+| 审查员封存前可裁决隔离测量链异常站点（带稳定隔离标识与原因） | `POST /api/batches/{id}/quarantine`；被隔离站既有赞成票**立即排出有效集合**（计票/快照/指纹均排除），未达阈值批次保持收集中 |
+| 同隔离标识+同站点+同原因重传：**回放首次裁决，不重复变更** | 命中即回放原记录与时间戳，`replayed=true`、`revision` 不增长 |
+| 同隔离标识改站点/改原因、或对已隔离站重复裁决：**可操作冲突** | `409 QUARANTINE_CONFLICT`，附首次裁决、本次提交与修正提示，不做任何变更 |
+| 已隔离站后续投票（含重传）**不得恢复计票** | 原赞成票重传仍为幂等回放但保持排出；新载荷 `422 STATION_QUARANTINED` |
+| 隔离与临界赞成票/封签并发：快照只能二选一且不矛盾 | 全部共用同一把全局锁；封存先行则隔离 `409 BATCH_SEALED` 且无隔离记录，隔离先行则有效票不足保持收集中，证书绝不含被隔离站 |
+| 封存后的隔离请求：**拒绝且证书逐字节不变** | `409 BATCH_SEALED`，不写入任何隔离记录 |
 | 已封存批次不可回收集中；迟到票不改写证书 | 未见新载荷 → `409 LATE_VOTE_REJECTED`；已接受载荷重传 → 回放 |
 | 写入/封签途中崩溃可恢复 | 临时文件 + `fsync` + 原子 `rename`；启动加载持久记录并清理半截 `.tmp` 文件 |
 | 刷新/轮询/过期响应不得用较旧状态覆盖封存 | 前端按批次比较 `revision` 丢弃过期响应；封存状态单向不可逆，不降级渲染 |
@@ -28,11 +34,14 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
 - `web`：交付页面 `http://localhost:${WEB_PORT:-8080}/` 与健康检查 `/health`，数据写入命名卷 `seal-data`。
 - `verify`：通过 `depends_on: service_healthy` **等待页面与健康响应可用后**执行
   `verify/verify.py`，覆盖：
-  1. 代码测试（unittest）：幂等重放回放、冲突票隔离、配置/参数拒绝；
-  2. 页面构建可用（`/` 返回含控制台与脚本的真实页面）；
-  3. API/HTTP 冒烟：健康响应、20 路并发投票封签唯一性、封存后 30 路并发冲击；
+  1. 代码测试（unittest）：幂等重放回放、冲突票隔离、配置/参数拒绝、
+     审查员隔离裁决（排出有效集合、幂等回放、冲突反馈、封存拒绝、投票不恢复计票、落盘）；
+  2. 构建检查（`/` 返回含隔离裁决控制台与脚本的真实页面，全部 Python 源码可编译）；
+  3. API/HTTP 冒烟：健康响应、20 路并发投票封签唯一性、封存后 30 路并发冲击、
+     **隔离/临界赞成票/封签并发交错（两种合法结局均校验一致性）、隔离同标识并发回放/冲突**；
   4. 重启恢复：复制线上持久记录冷启动全新进程（含两次重启 + 半截临时文件），
-     校验收集状态、赞成票、冲突票、证书逐字节一致与迟到票拒绝。
+     校验收集状态、赞成票、冲突票、**隔离记录与有效票数**、证书逐字节一致、
+     封存后隔离拒绝与迟到票拒绝。
   
   **完成即退出，退出码 0/非 0 报告验收结果。**
 
@@ -62,10 +71,24 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
 - `422 VOTE_ID_CHANGED` / `422 DIGEST_MISMATCH`：冲突隔离（详情含 `replayed`、当前批次快照）。
 - `422 STATION_NOT_LISTED`、`422 INVALID_*`：配置不符 / 参数无效，附可操作字段。
 - `409 LATE_VOTE_REJECTED`：批次已封存且为未见过的新载荷。
+- `422 STATION_QUARANTINED`：站点已被审查员隔离，新载荷不得恢复计票（原票重传仍回放）。
+
+### `POST /api/batches/{id}/quarantine` —— 审查员封存前隔离裁决
+```json
+{ "station": "站A", "quarantine_id": "q-20261005-A-chain-0001", "reason": "地面站测量链异常，复核数据漂移超差" }
+```
+- `200`：`{accepted, replayed, quarantine_id, station, reason, ts, excluded_prior_yes, batch}`——
+  被隔离站的既有赞成票立即排出有效集合（`excluded_prior_yes=true`），有效票不足阈值时批次保持收集中。
+- 同 `quarantine_id` + 同站点 + 同原因重传：`replayed=true`，回放首次裁决与时间戳，不重复变更。
+- `409 QUARANTINE_CONFLICT`：同标识改绑站点或改写原因，或对已隔离站用新标识重复裁决；
+  详情含 `existing`（首次裁决）、`submitted`（本次提交）与 `hint`（修正建议）。
+- `409 BATCH_SEALED`：封存后的隔离请求，证书逐字节不变（不写隔离记录）。
+- `422 STATION_NOT_LISTED` / `422 INVALID_PARAMETER`：站点不在冻结名单 / 参数无效。
 
 ### 查询
 - `GET /api/batches` / `GET /api/batches/{id}`：快照含 `status`、冻结配置、
-  `yes_count`/`yes_stations`、`conflicts[]`、`certificate`、单调 `revision`。
+  `yes_count`/`yes_stations`（仅未隔离有效票）、`excluded_yes_stations`（被隔离且曾投赞成的站）、
+  `quarantines[]`（隔离标识/站点/原因/时间）、`conflicts[]`、`certificate`、单调 `revision`。
 - `GET /health`：`{"status":"ok","revision":N}`，同时用于容器健康检查。
 - `GET /`：封存控制台页面（每 2 秒轮询，revision 防旧、封存不降级）。
 
