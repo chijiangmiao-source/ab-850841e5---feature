@@ -5,10 +5,14 @@
   * 首次有效投票原子冻结：站点名单、阈值、摘要摘要(digest)。
   * 同站 + 同摘要 + 同稳定投票标识的重传只回放首次结果，不增票。
   * 绑定内容改变（不同投票标识）或不同摘要 -> 记录冲突票，隔离且不计入赞成票。
+  * 审查员可在批次封存前提交隔离裁决（稳定隔离标识 + 原因）：被隔离站及其既有
+    赞成票立即排出有效集合；相同标识及相同内容重传只回放首次裁决，不重复变更；
+    同一标识改用不同站点或原因返回可操作冲突。已隔离站的后续投票（含重传）永不计票。
   * 赞成站数达到阈值的瞬间在同一把锁、同一次落盘内生成唯一不可变证书；
-    此后一切投票迟到拒绝，证书永不变更。
+    隔离、临界票与封签在全局锁下串行，最终快照要么按未隔离有效票唯一封存，
+    要么保持收集中并记录隔离；封存后的隔离请求一律拒绝，证书逐字节不变。
   * 每次变更以 临时文件 + fsync + rename 原子落盘；重启后从持久记录恢复，
-    已封存批次恢复后仍为 sealed。
+    隔离记录、有效票数与封存状态一并恢复，已封存批次恢复后仍为 sealed。
 """
 
 from __future__ import annotations
@@ -34,6 +38,8 @@ MAX_STATIONS = 100
 STATION_MAX_LEN = 64
 DIGEST_MAX_LEN = 200
 VOTE_ID_MAX_LEN = 200
+QUARANTINE_ID_MAX_LEN = 100
+QUARANTINE_REASON_MAX_LEN = 500
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_.@:/\-]{1,64}$")
 
 VOTE_KIND_YES = "yes"
@@ -124,8 +130,19 @@ class Store:
     # ---------- 快照 ----------
 
     @staticmethod
+    def _quarantined_map(b) -> dict:
+        return {q["station"]: q for q in b.get("quarantines", [])}
+
+    @staticmethod
+    def _effective_yes_votes(b):
+        """未隔离站点的赞成票；被裁决隔离的站点既有赞成票全部排出有效集合。"""
+        quarantined = {q["station"] for q in b.get("quarantines", [])}
+        return [v for v in b["votes"] if v["kind"] == VOTE_KIND_YES and v["station"] not in quarantined]
+
+    @staticmethod
     def _snapshot(b: dict, revision: int) -> dict:
-        yes_votes = [v for v in b["votes"] if v["kind"] == VOTE_KIND_YES]
+        quarantined = {q["station"] for q in b.get("quarantines", [])}
+        yes_votes = [v for v in b["votes"] if v["kind"] == VOTE_KIND_YES and v["station"] not in quarantined]
         yes_stations = sorted({v["station"] for v in yes_votes})
         conflicts = [
             {
@@ -138,6 +155,22 @@ class Store:
             for v in b["votes"]
             if v["kind"] == VOTE_KIND_CONFLICT
         ]
+        yes_station_set = set(yes_stations)
+        def _q_view(q):
+            # 被隔离站必不在有效集合；had_yes 表示其是否存在被排出的既有赞成票。
+            had_yes = any(
+                v["station"] == q["station"] and v["kind"] == VOTE_KIND_YES for v in b["votes"]
+            )
+            return {
+                "id": q["id"],
+                "station": q["station"],
+                "reason": q["reason"],
+                "ts": q["ts"],
+                "had_yes_vote": had_yes,
+                "yes_vote_excluded": had_yes and q["station"] not in yes_station_set,
+            }
+
+        quarantines = [_q_view(q) for q in b.get("quarantines", [])]
         return {
             "id": b["id"],
             "status": "sealed" if b["certificate"] else "collecting",
@@ -148,6 +181,8 @@ class Store:
             "yes_count": len(yes_stations),
             "yes_stations": yes_stations,
             "conflicts": conflicts,
+            "quarantines": quarantines,
+            "quarantined_stations": sorted(quarantined),
             "certificate": b["certificate"],
             "revision": revision,
         }
@@ -209,6 +244,7 @@ class Store:
                 "digest": None,        # 由首次有效投票冻结
                 "frozen_at": None,
                 "votes": [],
+                "quarantines": [],     # 审查员隔离裁决（稳定隔离标识 -> 站点 + 原因）
                 "certificate": None,
             }
             self.state["batches"][batch_id] = b
@@ -258,8 +294,10 @@ class Store:
 
     @staticmethod
     def _fingerprint(b) -> str:
+        quarantined = {q["station"] for q in b.get("quarantines", [])}
         yeses = sorted(
-            ((v["station"], v["vote_id"], v["id"]) for v in b["votes"] if v["kind"] == VOTE_KIND_YES),
+            ((v["station"], v["vote_id"], v["id"]) for v in b["votes"]
+             if v["kind"] == VOTE_KIND_YES and v["station"] not in quarantined),
             key=lambda x: x[0],
         )
         material = {
@@ -290,14 +328,19 @@ class Store:
                     {"station": station, "frozen_stations": list(b["stations"])},
                 )
 
+            quarantined = self._quarantined_map(b)
+
             # 幂等回放优先于一切状态判定：同站同摘要同投票标识的赞成票，
             # 即使批次已封存也只回放首次结果（“迟到票”仅指未见过的新载荷）。
+            # 但回放绝不恢复计票：若该站此后被审查员裁决隔离，有效集合仍将其排除。
             existing_yes = self._find_vote(b, station, digest, vote_id, VOTE_KIND_YES)
             if existing_yes is not None:
                 return 200, {
                     "accepted": True,
                     "replayed": True,
                     "vote_id": existing_yes["id"],
+                    "quarantined": station in quarantined,
+                    "counted": station not in quarantined,
                     "batch": self._snapshot(b, self.state["revision"]),
                 }
 
@@ -316,6 +359,20 @@ class Store:
                     409, "LATE_VOTE_REJECTED",
                     f"批次 {batch_id} 已封存，证书不可变，迟到票被拒绝",
                     {"batch": self._snapshot(b, self.state["revision"])},
+                )
+
+            # 审查员裁决隔离的站点：任何后续投票（含“新”载荷）都不得恢复计票。
+            if station in quarantined:
+                q = quarantined[station]
+                raise ApiError(
+                    422, "STATION_QUARANTINED",
+                    f"站点 {station} 已被审查员裁决隔离（隔离标识 {q['id']}），其投票不计入有效集合",
+                    {
+                        "station": station,
+                        "quarantine_id": q["id"],
+                        "quarantine_reason": q["reason"],
+                        "batch": self._snapshot(b, self.state["revision"]),
+                    },
                 )
 
             # 摘要已冻结且不同：冲突隔离。
@@ -376,6 +433,104 @@ class Store:
                 "froze_config": frozen_now,
                 "vote_id": vote["id"],
                 "batch": self._snapshot(b, self.state["revision"]),
+            }
+
+    # ---------- 审查员隔离裁决 ----------
+
+    def quarantine_station(self, batch_id, quarantine_id, station, reason):
+        """审查员在封存前提交隔离裁决。返回 (http_status, payload)。
+
+        规则：
+          * 仅收集中批次可裁决；封存后的隔离请求一律 409 拒绝，证书逐字节不变。
+          * 相同隔离标识 + 相同站点 + 相同原因重传：回放首次裁决结果，不重复变更。
+          * 相同隔离标识但站点或原因不同：409 冲突，返回首次裁决内容供核对修正。
+          * 被隔离站的既有赞成票立即排出有效集合；有效票不足阈值时批次保持收集中。
+        """
+        quarantine_id = _require_str(quarantine_id, "quarantine_id", QUARANTINE_ID_MAX_LEN)
+        station = _require_str(station, "station", STATION_MAX_LEN)
+        reason = _require_str(reason, "reason", QUARANTINE_REASON_MAX_LEN)
+        with self.lock:
+            b = self.state["batches"].get(batch_id)
+            if b is None:
+                raise ApiError(404, "BATCH_NOT_FOUND", f"批次 {batch_id} 不存在", {"batch_id": batch_id})
+
+            prior = None
+            for q in b.get("quarantines", []):
+                if q["id"] == quarantine_id:
+                    prior = q
+                    break
+
+            # 相同隔离标识：内容一致 => 任何状态下都回放首次结果（封存后亦同），
+            # 绝不重复变更；内容不一致 => 可操作冲突（同样不产生新变更）。
+            if prior is not None:
+                same = prior["station"] == station and prior["reason"] == reason
+                if not same:
+                    raise ApiError(
+                        409, "QUARANTINE_ID_CONFLICT",
+                        f"隔离标识 {quarantine_id} 已绑定首次裁决"
+                        f"（站点 {prior['station']}，原因：{prior['reason']}），"
+                        "不得改用不同站点或原因重传",
+                        {
+                            "quarantine_id": quarantine_id,
+                            "existing": {
+                                "station": prior["station"],
+                                "reason": prior["reason"],
+                                "ts": prior["ts"],
+                            },
+                            "submitted": {"station": station, "reason": reason},
+                            "hint": "请沿用首次裁决的站点与原因重传（将幂等回放），"
+                                    "或改用新的隔离标识提交另一项裁决。",
+                            "batch": self._snapshot(b, self.state["revision"]),
+                        },
+                    )
+                return 200, {
+                    "accepted": True,
+                    "replayed": True,
+                    "quarantine_id": prior["id"],
+                    "station": prior["station"],
+                    "reason": prior["reason"],
+                    "batch": self._snapshot(b, self.state["revision"]),
+                }
+
+            # 封存后的（新）隔离请求必须被拒绝，证书逐字节不变。
+            if b["certificate"] is not None:
+                cert_bytes = json.dumps(
+                    b["certificate"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                raise ApiError(
+                    409, "QUARANTINE_REJECTED_SEALED",
+                    f"批次 {batch_id} 已封存，不再受理隔离裁决，证书不可变",
+                    {
+                        "batch": self._snapshot(b, self.state["revision"]),
+                        "certificate_sha256": hashlib.sha256(cert_bytes.encode("utf-8")).hexdigest(),
+                    },
+                )
+
+            if station not in b["stations"]:
+                raise ApiError(
+                    422, "STATION_NOT_LISTED",
+                    f"站点 {station} 不在批次冻结名单中，无法对其裁决隔离",
+                    {"station": station, "frozen_stations": list(b["stations"])},
+                )
+
+            record = {
+                "id": quarantine_id,
+                "station": station,
+                "reason": reason,
+                "ts": utc_now(),
+            }
+            b.setdefault("quarantines", []).append(record)
+            self.state["revision"] += 1
+            self._persist_locked()
+
+            snapshot = self._snapshot(b, self.state["revision"])
+            return 200, {
+                "accepted": True,
+                "replayed": False,
+                "quarantine_id": quarantine_id,
+                "station": station,
+                "reason": reason,
+                "batch": snapshot,
             }
 
 
@@ -468,6 +623,13 @@ class Handler(BaseHTTPRequestHandler):
                 data = self._read_json()
                 status, payload = STORE.cast_vote(
                     batch_id, data.get("station"), data.get("digest"), data.get("vote_id")
+                )
+                self._send_json(status, payload)
+            elif path.startswith("/api/batches/") and path.endswith("/quarantine"):
+                batch_id = unquote(path[len("/api/batches/"):-len("/quarantine")])
+                data = self._read_json()
+                status, payload = STORE.quarantine_station(
+                    batch_id, data.get("quarantine_id"), data.get("station"), data.get("reason")
                 )
                 self._send_json(status, payload)
             else:

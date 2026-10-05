@@ -5,15 +5,22 @@
   A. 代码测试（unittest）
      - 同站同摘要同稳定投票标识的幂等重传：回放首次结果、不增票；
      - 投票标识内容改变 / 摘要不同：冲突票隔离、不计入赞成票、不参与封存；
-     - 配置不符与参数无效的可操作拒绝（错误码可读）。
-  B. 页面构建可用：/ 返回包含控制台与脚本的真实页面。
+     - 配置不符与参数无效的可操作拒绝（错误码可读）；
+     - 审查员隔离裁决：稳定隔离标识 + 原因，既有赞成票排出有效集合，
+       未达阈值保持收集中；相同标识相同内容重放回放、不重复变更；
+       相同标识改站点/改原因给出可操作冲突；已隔离站投票（含重传）不恢复计票。
+  B. 页面构建可用：/ 返回包含控制台、隔离裁决表单与脚本的真实页面。
   C. API/HTTP 冒烟
      - /health 健康响应；
      - 多站并发投票下封签唯一（证书唯一、指纹一致、迟到票拒绝）；
-     - 封存后并发冲击不可改写证书。
+     - 封存后并发冲击不可改写证书；
+     - 隔离/临界赞成票/封签并发：最终快照要么按未隔离有效票唯一封存，
+       要么保持收集中并记录隔离，证书不与有效赞成集合矛盾；
+     - 封存后的隔离请求被拒绝且证书逐字节不变。
   D. 重启恢复
      - 复制线上持久记录，拉起全新服务进程（模拟重启），
-       验证收集中批次的票与冻结配置恢复、已封存批次仍为 sealed 且证书逐字节一致；
+       验证收集中批次的票、冻结配置、隔离记录与有效票数恢复、
+       已封存批次仍为 sealed 且证书逐字节一致；
      - 模拟写入途中崩溃残留的临时文件不影响恢复；
      - 二次重启结果不变，迟到票仍被拒绝。
 
@@ -98,6 +105,10 @@ class Http:
         return self.post(f"/api/batches/{bid}/votes",
                          {"station": station, "digest": digest, "vote_id": vote_id})
 
+    def quarantine(self, bid, quarantine_id, station, reason):
+        return self.post(f"/api/batches/{bid}/quarantine",
+                         {"quarantine_id": quarantine_id, "station": station, "reason": reason})
+
 
 API = Http(BASE_URL)
 
@@ -117,14 +128,14 @@ def wait_available(max_wait=90):
             if st != 200 or not isinstance(body, str):
                 page_ok = False
             else:
-                page_ok = "封存控制台" in body and "castVote" in body
+                page_ok = "封存控制台" in body and "castVote" in body and "submitQuarantine" in body
         except Exception:
             page_ok = False
         if health_ok and page_ok:
             break
         time.sleep(0.5)
     check(health_ok, f"健康响应可用：GET {BASE_URL}/health → 200 status=ok")
-    check(page_ok, "页面可用：GET / 返回 200 且包含控制台界面与投票脚本")
+    check(page_ok, "页面可用：GET / 返回 200 且包含控制台、隔离裁决表单与脚本")
     return health_ok and page_ok
 
 
@@ -258,6 +269,141 @@ class CodeTests(unittest.TestCase):
         self.assertEqual(st, 422)
         self.assertEqual(r["error"]["code"], "INVALID_PARAMETER")
 
+    # ---------- 审查员隔离裁决 ----------
+
+    def test_05_quarantine_excludes_prior_yes_and_keeps_collecting(self):
+        # 4 站阈值 3：2 票后隔离其中一站（有效票降为 1），批次保持收集中，
+        # 需由其余未隔离站补足 3 张有效票才封存。
+        st, _, bid2 = API.create(["站A", "站B", "站C", "站D"], 3)
+        API.vote(bid2, "站A", "digest-D1", "sv-A-1")
+        API.vote(bid2, "站B", "digest-D1", "sv-B-1")
+
+        qid = f"qr-{uuid.uuid4().hex[:10]}"
+        st, r = API.quarantine(bid2, qid, "站B", "测量链遥测抖动超阈值")
+        self.assertEqual(st, 200, r)
+        self.assertFalse(r["replayed"], "首次裁决不是回放")
+        b = r["batch"]
+        self.assertEqual(b["status"], "collecting", "有效票 1 < 阈值 3，批次必须保持收集中")
+        self.assertEqual(b["yes_count"], 1, "被隔离站既有赞成票排出有效集合")
+        self.assertEqual(b["yes_stations"], ["站A"])
+        self.assertIn("站B", b["quarantined_stations"])
+        self.assertEqual(len(b["quarantines"]), 1)
+        q = b["quarantines"][0]
+        self.assertEqual(q["id"], qid)
+        self.assertEqual(q["station"], "站B")
+        self.assertEqual(q["reason"], "测量链遥测抖动超阈值")
+        self.assertTrue(q["had_yes_vote"], "页面须呈现该站既有赞成票")
+        self.assertTrue(q["yes_vote_excluded"], "页面须呈现既有赞成票已排出有效集合")
+        self.assertIsNone(b["certificate"], "未达阈值不得封存")
+
+        # 被隔离站重传其既有赞成票：回放首次投票记录，但绝不恢复计票。
+        st, r = API.vote(bid2, "站B", "digest-D1", "sv-B-1")
+        self.assertEqual(st, 200)
+        self.assertTrue(r["replayed"])
+        self.assertTrue(r.get("quarantined"), "回放须标注该站已隔离")
+        self.assertFalse(r.get("counted"), "回放不得恢复计票")
+        self.assertEqual(r["batch"]["yes_count"], 1)
+
+        # 被隔离站提交“新”载荷同样被拒，不恢复计票。
+        st, r = API.vote(bid2, "站B", "digest-D1", "sv-B-NEW")
+        self.assertEqual(st, 422)
+        self.assertEqual(r["error"]["code"], "STATION_QUARANTINED")
+        self.assertEqual(r["error"]["details"]["quarantine_id"], qid)
+
+        # 其余有效站投票补足阈值：C 到达 2 张仍未封存，D 到达 3 张才封存，
+        # 证书只含未隔离有效站，与有效赞成集合一致。
+        st, r = API.vote(bid2, "站C", "digest-D1", "sv-C-1")
+        self.assertEqual(st, 200, r)
+        self.assertIsNone(r["batch"]["certificate"], "有效票 2 < 阈值 3，仍须收集中")
+        st, r = API.vote(bid2, "站D", "digest-D1", "sv-D-1")
+        self.assertEqual(st, 200, r)
+        cert = r["batch"]["certificate"]
+        self.assertIsNotNone(cert, "补足未隔离有效票后封存")
+        self.assertEqual(cert["stations"], ["站A", "站C", "站D"], "证书不得含被隔离站站B")
+
+    def test_06_quarantine_same_id_same_content_replays_without_change(self):
+        st, _, bid = API.create(["qA", "qB", "qC"], 3)
+        API.vote(bid, "qA", "D1", "v-A")
+        qid = f"qr-{uuid.uuid4().hex[:10]}"
+        st, r1 = API.quarantine(bid, qid, "qB", "测量链异常 R1")
+        self.assertEqual(st, 200)
+        rev1 = r1["batch"]["revision"]
+        ts1 = r1["batch"]["quarantines"][0]["ts"]
+
+        # 相同隔离标识 + 相同站点 + 相同原因重传两次：回放首次结果，revision 不变。
+        for _ in range(2):
+            st, r = API.quarantine(bid, qid, "qB", "测量链异常 R1")
+            self.assertEqual(st, 200, r)
+            self.assertTrue(r["replayed"], "相同标识相同内容必须回放")
+            self.assertEqual(r["batch"]["revision"], rev1, "回放不得重复变更（revision 不增）")
+            self.assertEqual(len(r["batch"]["quarantines"]), 1, "不得重复堆积裁决")
+            self.assertEqual(r["batch"]["quarantines"][0]["ts"], ts1, "回放首次裁决时间")
+
+    def test_07_quarantine_same_id_different_station_or_reason_conflicts(self):
+        st, _, bid = API.create(["qA", "qB", "qC"], 3)
+        qid = f"qr-{uuid.uuid4().hex[:10]}"
+        st, _ = API.quarantine(bid, qid, "qB", "测量链异常 R1")
+        self.assertEqual(st, 200)
+
+        # 相同标识改用不同原因：可操作冲突，且不改变既有裁决。
+        st, r = API.quarantine(bid, qid, "qB", "测量链异常 R2-不同原因")
+        self.assertEqual(st, 409, r)
+        self.assertEqual(r["error"]["code"], "QUARANTINE_ID_CONFLICT")
+        d = r["error"]["details"]
+        self.assertEqual(d["existing"]["station"], "qB")
+        self.assertEqual(d["existing"]["reason"], "测量链异常 R1")
+        self.assertEqual(d["submitted"]["reason"], "测量链异常 R2-不同原因")
+        self.assertTrue(d.get("hint"), "冲突反馈须可操作（提示沿用或换新标识）")
+
+        # 相同标识改用不同站点：同样冲突。
+        st, r = API.quarantine(bid, qid, "qC", "测量链异常 R1")
+        self.assertEqual(st, 409)
+        self.assertEqual(r["error"]["code"], "QUARANTINE_ID_CONFLICT")
+        self.assertEqual(r["error"]["details"]["submitted"]["station"], "qC")
+
+        st, b = API.get_batch(bid)
+        self.assertEqual(len(b["quarantines"]), 1, "冲突重传不得改写或新增裁决")
+        self.assertEqual(b["quarantined_stations"], ["qB"])
+
+    def test_08_quarantine_rejected_after_sealed_and_cert_byte_identical(self):
+        st, _, bid = API.create(["sA", "sB"], 2)
+        API.vote(bid, "sA", "D1", "v-A")
+        st, r = API.vote(bid, "sB", "D1", "v-B")
+        self.assertEqual(st, 200)
+        cert_before = r["batch"]["certificate"]
+        canon = lambda c: json.dumps(c, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        cert_bytes_before = canon(cert_before)
+
+        # 封存后的隔离请求必须被拒绝。
+        qid = f"qr-{uuid.uuid4().hex[:10]}"
+        st, r = API.quarantine(bid, qid, "sB", "封存后才上报的测量链异常")
+        self.assertEqual(st, 409, r)
+        self.assertEqual(r["error"]["code"], "QUARANTINE_REJECTED_SEALED")
+
+        st, b = API.get_batch(bid)
+        self.assertEqual(b["status"], "sealed")
+        self.assertEqual(b["quarantines"], [], "封存后不得写入隔离记录")
+        self.assertEqual(canon(b["certificate"]), cert_bytes_before, "证书逐字节不变")
+
+    def test_09_quarantine_station_not_listed_and_invalid_params(self):
+        st, _, bid = API.create(["qA", "qB"], 2)
+        st, r = API.quarantine(bid, f"qr-{uuid.uuid4().hex[:6]}", "qX-未授权", "原因")
+        self.assertEqual(st, 422)
+        self.assertEqual(r["error"]["code"], "STATION_NOT_LISTED")
+
+        for payload in [
+            {"quarantine_id": "", "station": "qA", "reason": "r"},
+            {"quarantine_id": "q1", "station": "qA", "reason": ""},
+            {"quarantine_id": "q1", "station": "", "reason": "r"},
+        ]:
+            st, r = API.post(f"/api/batches/{bid}/quarantine", payload)
+            self.assertEqual(st, 422, payload)
+            self.assertEqual(r["error"]["code"], "INVALID_PARAMETER", payload)
+
+        st, r = API.quarantine(f"missing-{uuid.uuid4().hex[:6]}", "q1", "qA", "r")
+        self.assertEqual(st, 404)
+        self.assertEqual(r["error"]["code"], "BATCH_NOT_FOUND")
+
 
 # ------------------------------------------------------------- C. 并发封签唯一性
 
@@ -347,6 +493,125 @@ def test_concurrent_seal_uniqueness():
     check(b2["yes_count"] == 5, "冲突票不计入赞成票")
 
 
+def _assert_cert_consistency(b, label):
+    """证书不得与未隔离有效赞成集合矛盾。"""
+    cert = b["certificate"]
+    if cert is None:
+        return True
+    ok = True
+    qset = set(b.get("quarantined_stations", []))
+    if cert["stations"] != b["yes_stations"]:
+        check(False, f"{label}：证书赞成站与有效赞成集合一致")
+        ok = False
+    if set(cert["stations"]) & qset:
+        check(False, f"{label}：证书不含任何被隔离站")
+        ok = False
+    if len(cert["stations"]) != b["threshold"]:
+        check(False, f"{label}：证书赞成站数等于阈值")
+        ok = False
+    if cert.get("immutable") is not True or len(cert.get("fingerprint", "")) != 64:
+        check(False, f"{label}：证书 immutable 且指纹为 SHA-256")
+        ok = False
+    if ok:
+        check(True, f"{label}：证书与未隔离有效赞成集合一致（{cert['stations']}）")
+    return ok
+
+
+def test_concurrent_quarantine_vs_threshold():
+    print("\n== 隔离 / 临界赞成票 / 封签并发到达 ==")
+
+    # 情形一：任何交错下都应封存，但证书只能按未隔离有效票生成。
+    stations = ["y0", "y1", "y2"]
+    st, _, bid = API.create(stations, 2)
+    check(st == 201, f"批次 {bid} 创建：3 站、阈值 2")
+    st, r = API.vote(bid, "y0", f"D-{bid}", "vid-y0")
+    check(st == 200 and r["batch"]["yes_count"] == 1, "预置 y0 一票（有效赞成=1）")
+    qid = f"qr-{uuid.uuid4().hex[:10]}"
+    results = []
+    barrier = threading.Barrier(3)
+
+    def racer(op):
+        barrier.wait()
+        if op == "vote-y1":
+            results.append(("vote-y1", API.vote(bid, "y1", f"D-{bid}", "vid-y1")))
+        elif op == "vote-y2":
+            results.append(("vote-y2", API.vote(bid, "y2", f"D-{bid}", "vid-y2")))
+        else:
+            results.append(("quarantine-y1", API.quarantine(bid, qid, "y1", "测量链异常-并发")))
+
+    ths = [threading.Thread(target=racer, args=(op,))
+           for op in ("vote-y1", "vote-y2", "quarantine-y1")]
+    for t in ths: t.start()
+    for t in ths: t.join()
+
+    st, b = API.get_batch(bid)
+    check(b["status"] == "sealed", "情形一：有效票必然达到阈值，最终封存")
+    allowed = (["y0", "y1"], ["y0", "y2"])
+    check(b["certificate"]["stations"] in allowed,
+          f"情形一：证书只可能是 {allowed} 之一（实际 {b['certificate']['stations']}）")
+    _assert_cert_consistency(b, "情形一")
+
+    # 情形二：隔离与唯一一张临界票竞争——要么唯一封存，要么保持收集并记录隔离。
+    st, _, bid2 = API.create(["z0", "z1"], 2)
+    API.vote(bid2, "z0", f"D-{bid2}", "vid-z0")
+    qid2 = f"qr-{uuid.uuid4().hex[:10]}"
+    res2 = []
+    barrier2 = threading.Barrier(2)
+
+    def racer2(op):
+        barrier2.wait()
+        if op == "vote":
+            res2.append(API.vote(bid2, "z1", f"D-{bid2}", "vid-z1"))
+        else:
+            res2.append(API.quarantine(bid2, qid2, "z1", "测量链异常-临界竞争"))
+
+    ths = [threading.Thread(target=racer2, args=(op,)) for op in ("vote", "quarantine")]
+    for t in ths: t.start()
+    for t in ths: t.join()
+
+    st, b2 = API.get_batch(bid2)
+    if b2["status"] == "sealed":
+        check(b2["certificate"]["stations"] == ["z0", "z1"], "情形二（票先到）：唯一封存含两站")
+        check(b2["quarantines"] == [], "情形二（票先到）：封存后隔离未写入")
+        # 较晚到达的隔离裁决必须被拒绝。
+        late_q = [x for x in res2 if x[0] == 409
+                  and x[1]["error"]["code"] == "QUARANTINE_REJECTED_SEALED"]
+        check(len(late_q) == 1, "情形二（票先到）：后到的隔离请求 409 被拒绝")
+        _assert_cert_consistency(b2, "情形二（票先到）")
+    else:
+        check(b2["status"] == "collecting", "情形二（隔离先到）：保持收集中")
+        check(b2["yes_count"] == 1 and b2["yes_stations"] == ["z0"],
+              "情形二（隔离先到）：有效赞成仍为 1，未封存")
+        check(b2.get("quarantined_stations") == ["z1"], "情形二（隔离先到）：记录该站隔离")
+        check(b2["quarantines"][0]["id"] == qid2
+              and b2["quarantines"][0]["reason"] == "测量链异常-临界竞争",
+              "情形二（隔离先到）：隔离标识与原因持久可见")
+
+    # 情形三：封存后并发隔离冲击——全部拒绝，证书逐字节不变。
+    st, _, bid3 = API.create(["h0", "h1", "h2"], 2)
+    API.vote(bid3, "h0", f"D-{bid3}", "vid-h0")
+    st, r = API.vote(bid3, "h1", f"D-{bid3}", "vid-h1")
+    cert_canon = json.dumps(r["batch"]["certificate"], ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":"))
+    hammer = []
+
+    def q_hammer(i):
+        station = ["h0", "h1", "h2"][i % 3]
+        hammer.append(API.quarantine(bid3, f"qr-late-{i}-{uuid.uuid4().hex[:6]}",
+                                     station, f"封存后隔离冲击 {i}"))
+
+    ths = [threading.Thread(target=q_hammer, args=(i,)) for i in range(30)]
+    for t in ths: t.start()
+    for t in ths: t.join()
+    check(all(s == 409 and body["error"]["code"] == "QUARANTINE_REJECTED_SEALED"
+              for s, body in hammer), "封存后 30 个并发隔离请求全部 409 拒绝")
+    st, b3 = API.get_batch(bid3)
+    check(b3["quarantines"] == [], "封存后冲击未写入任何隔离记录")
+    check(json.dumps(b3["certificate"], ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":")) == cert_canon,
+          "封存后隔离冲击下证书逐字节不变")
+
+
 # ---------------------------------------------------------------- D. 重启恢复
 
 def _free_port():
@@ -404,6 +669,17 @@ def test_restart_recovery():
     st, r = API.vote(conflicting, "cB", "digest-WRONG", "vid-cB-wrong")
     check(st == 422 and r["error"]["code"] == "DIGEST_MISMATCH", "收集中批次含 1 张冲突票")
 
+    # 收集中批次 + 审查员隔离裁决：4 站阈值 3，2 票后隔离一站（有效票降为 1）。
+    _, _, quarant = API.create(["qA", "qB", "qC", "qD"], 3)
+    st, _ = API.vote(quarant, "qA", f"D-{quarant}", "vid-qA")
+    st, _ = API.vote(quarant, "qB", f"D-{quarant}", "vid-qB")
+    live_qid = f"qr-restart-{uuid.uuid4().hex[:8]}"
+    st, r = API.quarantine(quarant, live_qid, "qB", "地面站测量链异常-待复核")
+    check(st == 200 and r["batch"]["status"] == "collecting"
+          and r["batch"]["yes_count"] == 1, "收集中批次含隔离裁决：有效票 1/3、未封存")
+    live_q_ts = r["batch"]["quarantines"][0]["ts"]
+    live_rev = r["batch"]["revision"]
+
     src_db = os.path.join(SOURCE_DATA_DIR, "seal.db.json")
     for attempt in range(30):
         if os.path.exists(src_db):
@@ -429,6 +705,40 @@ def test_restart_recovery():
         check(st == 200 and b["status"] == "collecting", "收集中批次恢复为 collecting")
         check(b["yes_count"] == 1 and b["digest"] == f"D-{collecting}",
               "冻结摘要与赞成票从持久记录恢复")
+
+        # 审查员隔离裁决恢复：隔离记录、有效票数与未封存状态全部还原。
+        st, b = rapi.get_batch(quarant)
+        check(st == 200 and b["status"] == "collecting", "隔离批次恢复后仍为 collecting（未封存）")
+        check(b["yes_count"] == 1 and b["yes_stations"] == ["qA"],
+              "恢复后有效票数仍为 1：被隔离站 qB 的既有赞成票保持排出")
+        check(b.get("quarantined_stations") == ["qB"]
+              and len(b["quarantines"]) == 1, "隔离记录恢复：恰好 1 条裁决、qB 被隔离")
+        qrec = b["quarantines"][0]
+        check(qrec["id"] == live_qid and qrec["reason"] == "地面站测量链异常-待复核"
+              and qrec["ts"] == live_q_ts, "隔离标识、原因、首次裁决时间逐字恢复")
+        check(qrec["had_yes_vote"] and qrec["yes_vote_excluded"],
+              "恢复快照仍标注被隔离站既有赞成票已排出有效集合")
+        # 恢复后重传相同隔离裁决：回放首次结果，不重复变更。
+        st, r = rapi.quarantine(quarant, live_qid, "qB", "地面站测量链异常-待复核")
+        check(st == 200 and r.get("replayed") is True
+              and r["batch"]["revision"] == live_rev,
+              "恢复后相同裁决重传回放且 revision 不增")
+        # 恢复后被隔离站投票重传不恢复计票；新载荷被 STATION_QUARANTINED 拒绝。
+        st, r = rapi.vote(quarant, "qB", f"D-{quarant}", "vid-qB")
+        check(st == 200 and r.get("replayed") is True and r.get("quarantined") is True
+              and r["batch"]["yes_count"] == 1, "恢复后被隔离站赞成票重传仍排出有效集合")
+        st, r = rapi.vote(quarant, "qB", f"D-{quarant}", "vid-qB-2")
+        check(st == 422 and r["error"]["code"] == "STATION_QUARANTINED",
+              "恢复后被隔离站新投票不得恢复计票")
+        # 有效站 qC、qD 补足 3 张有效票后封存，证书只含未隔离有效站。
+        st, r = rapi.vote(quarant, "qC", f"D-{quarant}", "vid-qC")
+        check(st == 200 and r["batch"]["status"] == "collecting"
+              and r["batch"]["yes_count"] == 2, "有效票 2/3 时仍保持收集中")
+        st, r = rapi.vote(quarant, "qD", f"D-{quarant}", "vid-qD")
+        check(st == 200 and r["batch"]["status"] == "sealed"
+              and r["batch"]["certificate"]["stations"] == ["qA", "qC", "qD"],
+              "隔离批次由剩余有效站补足阈值后封存，证书排除被隔离站")
+        quarant_fp = r["batch"]["certificate"]["fingerprint"]
 
         # 冲突票持久化恢复：重传回放首次冲突，正确票仍可让批次封签。
         st, b = rapi.get_batch(conflicting)
@@ -475,6 +785,21 @@ def test_restart_recovery():
         st, r = rapi2.vote(collecting, "rA", f"D-{collecting}", "vid-rA")
         check(st == 200 and r.get("replayed") is True,
               "已统计过的投票重启后重传仍为幂等回放")
+
+        # 隔离批次第二次重启：仍 sealed，隔离记录保留，证书指纹不变。
+        st, b = rapi2.get_batch(quarant)
+        check(b["status"] == "sealed" and b["certificate"]["fingerprint"] == quarant_fp,
+              "第二次重启：隔离后封存的批次仍 sealed 且指纹不变")
+        check(b["certificate"]["stations"] == ["qA", "qC", "qD"]
+              and b.get("quarantined_stations") == ["qB"],
+              "第二次重启：证书持续排除被隔离站，隔离记录仍在")
+        st, r = rapi2.quarantine(quarant, f"qr-after-seal-{uuid.uuid4().hex[:6]}",
+                                 "qA", "封存后再次请求隔离")
+        check(st == 409 and r["error"]["code"] == "QUARANTINE_REJECTED_SEALED",
+              "第二次重启后：封存批次的新隔离请求仍被拒绝")
+        st, r = rapi2.quarantine(quarant, live_qid, "qB", "地面站测量链异常-待复核")
+        check(st == 200 and r.get("replayed") is True,
+              "第二次重启后：既有隔离裁决相同内容重传仍为回放")
     finally:
         proc2.kill()
         proc2.wait(timeout=10)
@@ -510,6 +835,12 @@ def main():
         FAILURES.append(f"并发封签测试异常: {e!r}")
         print(f"    ❌ 并发测试异常: {e!r}")
     try:
+        test_concurrent_quarantine_vs_threshold()
+    except Exception as e:
+        FAILURES.append(f"并发隔离裁决测试异常: {e!r}")
+        import traceback
+        traceback.print_exc()
+    try:
         test_restart_recovery()
     except Exception as e:
         FAILURES.append(f"重启恢复测试异常: {e!r}")
@@ -522,8 +853,8 @@ def main():
         for f in FAILURES:
             print(" -", f)
         return 1
-    print(f"✅ 验收全部通过：页面、健康、幂等、冲突隔离、并发唯一封签、重启恢复，"
-          f"用时 {time.time() - t0:.1f}s")
+    print(f"✅ 验收全部通过：页面、健康、幂等、冲突隔离、审查员隔离裁决、"
+          f"并发唯一封签、封存拒绝与重启恢复，用时 {time.time() - t0:.1f}s")
     return 0
 
 

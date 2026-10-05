@@ -12,6 +12,12 @@ Docker Compose 一键交付页面、健康响应与自动验收。
 | 同站 + 同摘要 + 同稳定投票标识重传：**只回放首次结果，不增票** | 三元组去重，封存后重传仍返回首次投票记录（含原内部 vote_id），HTTP 200 `replayed=true` |
 | 投票标识内容改变 / 不同摘要：**记录冲突、隔离、不参与封存** | `VOTE_ID_CHANGED` / `DIGEST_MISMATCH`，冲突票单列展示且重传去重回放 |
 | 站点不在冻结名单：**配置不符拒绝** | `STATION_NOT_LISTED`，响应附带冻结名单 |
+| 审查员封存前提交隔离裁决（稳定隔离标识+原因）：被隔离站及其**既有赞成票立即排出有效集合** | `POST /api/batches/{id}/quarantine`；快照持续呈现被隔离站、原因及其既有赞成票是否已排出；有效票不足阈值则批次保持收集中 |
+| 相同隔离标识 + 相同站点/原因重传：**回放首次裁决，不重复变更** | 按隔离标识去重，返回 `200 replayed=true` 与首次裁决，`revision` 不增 |
+| 相同隔离标识改用不同站点或原因：**可操作冲突** | `409 QUARANTINE_ID_CONFLICT`，详情回带首次裁决、本次提交与修正提示 |
+| 已隔离站的后续投票（含既有赞成票重传）**永不恢复计票** | 重传仍回放首次投票记录但标注 `quarantined/counted=false`；新载荷 `422 STATION_QUARANTINED` |
+| 隔离、临界赞成票与封签并发：最终快照**只能**按未隔离有效票唯一封存，或保持收集并记录隔离 | 全部判定串行于全局锁同一临界区；证书赞成站恒等于未隔离有效赞成集合 |
+| 封存后的隔离请求：**拒绝且证书逐字节不变** | `409 QUARANTINE_REJECTED_SEALED`；相同隔离标识的幂等回放仍可重放首次结果 |
 | 多站并发达到阈值：**只生成一份不可变证书** | 判定→计数→封签→fsync 落盘全部在全局锁同一临界区；证书含 SHA-256 指纹，`immutable=true` |
 | 已封存批次不可回收集中；迟到票不改写证书 | 未见新载荷 → `409 LATE_VOTE_REJECTED`；已接受载荷重传 → 回放 |
 | 写入/封签途中崩溃可恢复 | 临时文件 + `fsync` + 原子 `rename`；启动加载持久记录并清理半截 `.tmp` 文件 |
@@ -28,11 +34,12 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
 - `web`：交付页面 `http://localhost:${WEB_PORT:-8080}/` 与健康检查 `/health`，数据写入命名卷 `seal-data`。
 - `verify`：通过 `depends_on: service_healthy` **等待页面与健康响应可用后**执行
   `verify/verify.py`，覆盖：
-  1. 代码测试（unittest）：幂等重放回放、冲突票隔离、配置/参数拒绝；
-  2. 页面构建可用（`/` 返回含控制台与脚本的真实页面）；
-  3. API/HTTP 冒烟：健康响应、20 路并发投票封签唯一性、封存后 30 路并发冲击；
+  1. 代码测试（unittest）：幂等重放回放、冲突票隔离、审查员隔离裁决（排出有效票/回放/冲突反馈/封存拒绝）、配置/参数拒绝；
+  2. 页面构建可用（`/` 返回含控制台、隔离裁决表单与脚本的真实页面）；
+  3. API/HTTP 冒烟：健康响应、20 路并发投票封签唯一性、封存后 30 路并发冲击、
+     隔离/临界票/封签并发的唯一快照、封存后 30 路并发隔离拒绝（证书逐字节不变）；
   4. 重启恢复：复制线上持久记录冷启动全新进程（含两次重启 + 半截临时文件），
-     校验收集状态、赞成票、冲突票、证书逐字节一致与迟到票拒绝。
+     校验收集状态、赞成票、冲突票、**隔离记录与有效票数**、证书逐字节一致与迟到票拒绝。
   
   **完成即退出，退出码 0/非 0 报告验收结果。**
 
@@ -56,25 +63,46 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
 ```json
 { "station": "站A", "digest": "sha256:9f2c…", "vote_id": "sv-20261004-A-0001" }
 ```
-- `200`：`{accepted, replayed, froze_config, vote_id, batch}`——
+- `200`：`{accepted, replayed, froze_config, vote_id, quarantined, counted, batch}`——
   重传时 `replayed=true` 且 `vote_id` 为首次记录；首票 `froze_config=true`；
+  重传命中已隔离站时 `quarantined=true, counted=false`（回放但不恢复计票）；
   达到阈值时 `batch.certificate` 一次性出现。
 - `422 VOTE_ID_CHANGED` / `422 DIGEST_MISMATCH`：冲突隔离（详情含 `replayed`、当前批次快照）。
 - `422 STATION_NOT_LISTED`、`422 INVALID_*`：配置不符 / 参数无效，附可操作字段。
+- `422 STATION_QUARANTINED`：站点已被审查员裁决隔离，新载荷不恢复计票。
 - `409 LATE_VOTE_REJECTED`：批次已封存且为未见过的新载荷。
+
+### `POST /api/batches/{id}/quarantine` —— 审查员隔离裁决（封存前）
+```json
+{ "quarantine_id": "qr-20261004-B-chain-anomaly", "station": "站B",
+  "reason": "地面站测量链遥测抖动超阈值，待复核" }
+```
+- `200`：`{accepted, replayed, quarantine_id, station, reason, batch}`——
+  首次裁决把被隔离站的既有赞成票排出有效集合，`yes_count` 只计未隔离有效票；
+  相同标识 + 相同站点/原因重传 `replayed=true`，回放首次裁决且 `revision` 不增。
+- `409 QUARANTINE_ID_CONFLICT`：相同标识改用不同站点或原因，
+  详情含首次裁决 `existing`、本次提交 `submitted` 与可操作 `hint`。
+- `409 QUARANTINE_REJECTED_SEALED`：批次已封存，新隔离请求被拒绝，证书逐字节不变
+  （详情附 `certificate_sha256`；相同标识的幂等回放仍返回首次裁决）。
+- `422 STATION_NOT_LISTED` / `422 INVALID_PARAMETER` / `404 BATCH_NOT_FOUND`：
+  配置不符 / 参数无效 / 批次不存在。
 
 ### 查询
 - `GET /api/batches` / `GET /api/batches/{id}`：快照含 `status`、冻结配置、
-  `yes_count`/`yes_stations`、`conflicts[]`、`certificate`、单调 `revision`。
+  `yes_count`/`yes_stations`（仅未隔离有效票）、`conflicts[]`、
+  `quarantines[]`（含 `had_yes_vote`/`yes_vote_excluded` 标注）、
+  `quarantined_stations[]`、`certificate`、单调 `revision`。
 - `GET /health`：`{"status":"ok","revision":N}`，同时用于容器健康检查。
-- `GET /`：封存控制台页面（每 2 秒轮询，revision 防旧、封存不降级）。
+- `GET /`：封存控制台页面（每 2 秒轮询，revision 防旧、封存不降级；隔离裁决区与被隔离站实况持续呈现）。
 
 ## 持久化与证书
 
 - 数据文件：`$DATA_DIR/seal.db.json`（compose 中为命名卷）。
   每次状态变更：写 `seal.db.json.tmp.<pid>.<tid>` → `fsync` → `os.replace` → 目录 `fsync`。
-- 证书字段：`batch_id`、冻结 `digest`、`threshold`、赞成站有序名单、
-  `fingerprint`（对冻结配置 + 赞成票规范序列化后的 SHA-256）、`sealed_at`、`immutable: true`。
+- 证书字段：`batch_id`、冻结 `digest`、`threshold`、**未隔离**赞成站有序名单、
+  `fingerprint`（对冻结配置 + 未隔离赞成票规范序列化后的 SHA-256）、`sealed_at`、`immutable: true`。
+- 隔离裁决记录：`quarantines[]`（`id` 稳定隔离标识、`station`、`reason`、`ts`），
+  重启后完整恢复；不含该字段的既有持久记录按无隔离自动兼容。
 
 ## 目录结构
 
@@ -82,9 +110,9 @@ WEB_PORT=9090 docker compose up --build --abort-on-container-exit --exit-code-fr
 docker-compose.yml      # web + verify 编排，WEB_PORT 可配置宿主端口
 web/
   Dockerfile            # python:3.11-slim，零 pip 安装
-  app/server.py         # 服务：API + 原子冻结/封签 + 崩溃安全持久化
-  app/index.html        # 控制台页面（轮询防旧、封存不降级）
+  app/server.py         # 服务：API + 原子冻结/封签 + 隔离裁决 + 崩溃安全持久化
+  app/index.html        # 控制台页面（隔离裁决、轮询防旧、封存不降级）
 verify/
   Dockerfile            # 验收镜像（同时携带 app 代码用于冷启动恢复测试）
-  verify.py             # 代码测试 + 页面/健康冒烟 + 并发唯一性 + 重启恢复，退出码报告
+  verify.py             # 代码测试 + 页面/健康冒烟 + 并发唯一性/隔离并发 + 重启恢复，退出码报告
 ```
